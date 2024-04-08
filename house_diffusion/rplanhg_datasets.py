@@ -81,7 +81,7 @@ def make_non_manhattan(poly, polygon, house_poly):
         return poly2
 
 get_bin = lambda x, z: [int(y) for y in format(x, 'b').zfill(z)]
-get_one_hot = lambda x, z: np.eye(z)[x]
+get_one_hot = lambda x, z: np.eye(z)[min(x, z-1)]     
 class RPlanhgDataset(Dataset):
     def __init__(self, set_name, analog_bit, target_set, non_manhattan=False):
         super().__init__()
