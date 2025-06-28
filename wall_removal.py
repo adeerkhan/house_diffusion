@@ -378,8 +378,8 @@ def process_json_file_to_json(input_json_path, output_json_path):
         all_output_polygons = aligned_polygons.copy()
         all_output_types = room_types_list.copy()
         
-        # Add boundary polygons with room type 18
-        boundary_room_type = 18  # Boundary room class (previously 9, which clashed with entrance type)
+        # Add boundary polygons with room type 9
+        boundary_room_type = 9  # Boundary room class
         for boundary_poly in boundary_polygons:
             all_output_polygons.append(boundary_poly)
             all_output_types.append(boundary_room_type)
@@ -476,20 +476,18 @@ def _create_boundary(room_polygons,
     # 2. Union everything into a single footprint
     footprint = unary_union(polys)
 
-    # 3. Split MultiPolygon into individual Polygons if needed
-    if isinstance(footprint, Polygon):
-        geoms = [footprint]
-    elif isinstance(footprint, MultiPolygon):
-        geoms = list(footprint.geoms)
+    # 3. If the result is a MultiPolygon, find the single largest component.
+    # This ensures we only get the main building outline, not detached parts.
+    if isinstance(footprint, MultiPolygon):
+        main_component = max(footprint.geoms, key=lambda p: p.area)
     else:
-        geoms = []
-    
-    # 4. Extract exterior coordinates for each resulting polygon.
-    boundaries = []
-    for g in geoms:
-        if g.is_empty or g.area < min_area:
-            continue
-        boundaries.append(np.asarray(g.exterior.coords[:-1]))  # drop duplicate last pt
+        main_component = footprint
 
-    return boundaries
+    # 4. Ensure the resulting polygon is valid and extract its exterior coordinates.
+    # This inherently ignores any interior holes.
+    if main_component.is_empty or main_component.area < min_area:
+        return []
+
+    boundary = np.asarray(main_component.exterior.coords[:-1])
+    return [boundary]
 

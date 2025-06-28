@@ -32,7 +32,8 @@ def visualize_floorplan(folder_path):
         5: 'Balcony', 
         6: 'Dining room', 
         7: 'Study room',
-        8: 'Storage'
+        8: 'Storage',
+        9: 'Boundary'
     }
     
     room_type_colors = {
@@ -44,7 +45,7 @@ def visualize_floorplan(folder_path):
         6: '#E6E6FA',  # Lavender - Dining room
         7: '#FFE4B5',  # Moccasin - Study room
         8: '#D3D3D3',  # Light gray - Storage
-        9: '#000000'   # Saddle brown - boundary
+        9: '#000000'   # Black - boundary
     }
     
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
@@ -76,8 +77,8 @@ def visualize_floorplan(folder_path):
                 boundary_count += 1
                 closed_poly = np.vstack([polygon, polygon[0]])
                 ax.plot(closed_poly[:, 0], closed_poly[:, 1], 
-                       color=room_color, linewidth=3, zorder=10, alpha=0.8)
-            else:  # Regular rooms (1-8) - draw filled with labels
+                       color=room_color, linewidth=4, zorder=10, alpha=0.8)
+            else:  # Regular rooms - draw filled with labels
                 room_count += 1
                 # Draw filled polygon
                 ax.fill(polygon[:, 0], polygon[:, 1], 
