@@ -5,9 +5,9 @@ import cv2 as cv
 from PIL import Image, ImageDraw
 import os
 import glob
-from shapely.geometry import Polygon as _ShapelyPolygon
+from shapely.geometry import Polygon, MultiPolygon
 from shapely.errors import TopologicalError
-import pyclipper
+from shapely.ops import unary_union
 
 def make_sequence(edges):
     """
@@ -364,22 +364,22 @@ def convert_polygons_to_edges_and_boxes(room_polygons, room_types, door_polygons
     
     return edges, boxes, eds_to_rms
 
-def process_json_file_to_json(input_json_path, output_json_path, boundary_offset=0.05):
+def process_json_file_to_json(input_json_path, output_json_path):
     try:
         room_polygons_list, room_types_list, _ = remove_walls(input_json_path)
         
         # Align polygons to close gaps between adjacent rooms.
         aligned_polygons = align_adjacent_boundaries(room_polygons_list)
         
-        # Create boundary polygons using pyclipper offset
-        boundary_polygons = _create_boundary(aligned_polygons, room_types_list, offset=boundary_offset)
+        # Create boundary polygons using Shapely
+        boundary_polygons = _create_boundary(aligned_polygons, room_types_list)
         
-        # Add boundary polygons to the output with room class 9
+        # Add boundary polygons to the output with room class 18
         all_output_polygons = aligned_polygons.copy()
         all_output_types = room_types_list.copy()
         
-        # Add boundary polygons with room type 9
-        boundary_room_type = 9  # Boundary room class
+        # Add boundary polygons with room type 18
+        boundary_room_type = 18  # Boundary room class (previously 9, which clashed with entrance type)
         for boundary_poly in boundary_polygons:
             all_output_polygons.append(boundary_poly)
             all_output_types.append(boundary_room_type)
@@ -411,7 +411,7 @@ def process_json_file_to_json(input_json_path, output_json_path, boundary_offset
         print(f"Error processing {input_json_path}: {str(e)}")
         return False
 
-def process_folder_json_files(input_folder, output_folder, boundary_offset=0.05):
+def process_folder_json_files(input_folder, output_folder):
     os.makedirs(output_folder, exist_ok=True)
     
     json_files = glob.glob(os.path.join(input_folder, "*.json"))
@@ -428,7 +428,7 @@ def process_folder_json_files(input_folder, output_folder, boundary_offset=0.05)
         
         output_path = os.path.join(output_folder, f"{filename}")
         
-        if process_json_file_to_json(json_file, output_path, boundary_offset):
+        if process_json_file_to_json(json_file, output_path):
             success_count += 1
     
     print(f"Successfully processed {success_count}/{len(json_files)} files")
@@ -442,7 +442,7 @@ def process_folder_json_files(input_folder, output_folder, boundary_offset=0.05)
 def _clean_polygon(polygon_coords, min_area=1e-4):
     """Return a cleaned numpy array of polygon coords or None if invalid/too small."""
     try:
-        poly = _ShapelyPolygon(polygon_coords)
+        poly = Polygon(polygon_coords)
         # Fix self-intersections
         if not poly.is_valid:
             poly = poly.buffer(0)
@@ -455,67 +455,41 @@ def _clean_polygon(polygon_coords, min_area=1e-4):
     except (TopologicalError, ValueError):
         return None
 
-def _create_boundary(room_polygons, room_types, offset=0.05):
+def _create_boundary(room_polygons,
+                     room_types,
+                     door_types={9, 10},     # 9 = entrance, 10 = interior door
+                     min_area=1e-4):
     """
-    Create boundary polygons around all rooms using pyclipper offset.
-    
-    Args:
-        room_polygons: List of room polygons
-        room_types: List of room types corresponding to polygons
-        offset: Offset distance for boundary creation (default 0.05)
-    
-    Returns:
-        List of boundary polygons
+    Build an exterior boundary that traces the exact exterior walls of all rooms (excluding doors).
+
+    Returns
+    -------
+    List[np.ndarray]  # one or more boundary polygons, each as float (N,2)
     """
-    # Use polygons directly without additional scaling
-    polygons_for_union = []
-    # Define ONLY the door types to exclude from union
-    door_types = {9, 10}  # Interior Door (10) and Main Door/Entrance (9)
+    # 1. Collect only the real rooms
+    polys = [Polygon(p) for p, t in zip(room_polygons, room_types)
+             if t not in door_types and len(p) >= 3]
+
+    if not polys:
+        return []
+
+    # 2. Union everything into a single footprint
+    footprint = unary_union(polys)
+
+    # 3. Split MultiPolygon into individual Polygons if needed
+    if isinstance(footprint, Polygon):
+        geoms = [footprint]
+    elif isinstance(footprint, MultiPolygon):
+        geoms = list(footprint.geoms)
+    else:
+        geoms = []
     
-    # Iterate through all polygons and their types
-    for poly, poly_type in zip(room_polygons, room_types):
-        if len(poly) < 3:  # Need at least 3 points for a valid polygon
+    # 4. Extract exterior coordinates for each resulting polygon.
+    boundaries = []
+    for g in geoms:
+        if g.is_empty or g.area < min_area:
             continue
-        # *** This is the crucial check ***
-        # If the polygon type is NOT one of the specified doors, include it
-        if poly_type not in door_types:  # Exclude Interior Door and Main Door
-            polygons_for_union.append([(float(x), float(y)) for x, y in poly])
-    
-    # If no valid polygons remain for union (unlikely unless only doors exist)
-    if not polygons_for_union:
-        return []
-    
-    # --- The rest of the function uses 'polygons_for_union' ---
-    # Use a scale factor for pyclipper to work reliably.
-    scale_factor = 10000.0  # Higher scale factor for better precision
-    scaled_polys = []
-    # Use the filtered list for the union operation
-    for p in polygons_for_union:
-        scaled_polys.append([(int(x * scale_factor), int(y * scale_factor)) for (x, y) in p])
-    
-    try:
-        pc = pyclipper.Pyclipper()
-        pc.AddPaths(scaled_polys, pyclipper.PT_SUBJECT, closed=True)
-        # The union is calculated ONLY from non-door polygons
-        union_result = pc.Execute(pyclipper.CT_UNION, pyclipper.PFT_EVENODD, pyclipper.PFT_EVENODD)
-        
-        if not union_result:
-            return []
-        
-        # Create offset boundary
-        offsetter = pyclipper.PyclipperOffset()
-        offsetter.AddPaths(union_result, pyclipper.JT_MITER, pyclipper.ET_CLOSEDPOLYGON)
-        offset_result = offsetter.Execute(offset * scale_factor)
-        
-        boundary_polygons = []
-        for out_poly in offset_result:
-            coords = [(x / scale_factor, y / scale_factor) for (x, y) in out_poly]
-            if len(coords) >= 3:  # Ensure valid polygon
-                boundary_polygons.append(np.array(coords))
-        
-        return boundary_polygons
-        
-    except Exception as e:
-        print(f"Error creating boundary: {str(e)}")
-        return []
+        boundaries.append(np.asarray(g.exterior.coords[:-1]))  # drop duplicate last pt
+
+    return boundaries
 

@@ -44,7 +44,7 @@ def visualize_floorplan(folder_path):
         6: '#E6E6FA',  # Lavender - Dining room
         7: '#FFE4B5',  # Moccasin - Study room
         8: '#D3D3D3',  # Light gray - Storage
-        9: '#8B4513'   # Saddle brown - boundary
+        9: '#000000'   # Saddle brown - boundary
     }
     
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
