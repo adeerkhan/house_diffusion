@@ -6,6 +6,7 @@ scripts/rplan
 scripts/houses.npz
 scripts/outputs
 dataset/
+processed/
 *.npz
 *.gif
 *.pt

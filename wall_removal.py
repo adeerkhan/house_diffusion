@@ -1,10 +1,13 @@
+# This script processes RPLAN floor plans to remove interior walls spaces. 
 import json
 import numpy as np
 import cv2 as cv
 from PIL import Image, ImageDraw
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
+import os
+import glob
+from shapely.geometry import Polygon as _ShapelyPolygon
+from shapely.errors import TopologicalError
+import pyclipper
 
 def make_sequence(edges):
     """
@@ -92,7 +95,6 @@ def build_graph_exact(rms_type, fp_eds, eds_to_rms, out_size=64):
         # draw rooms
         rm_im = Image.new('L', (im_size, im_size))
         dr = ImageDraw.Draw(rm_im)
-        
         for eds_poly in [eds]:
             poly = make_sequence(np.array([fp_eds[l][:4] for l in eds_poly]))[0]
             poly = [(im_size*x, im_size*y) for x, y in poly]
@@ -108,10 +110,11 @@ def build_graph_exact(rms_type, fp_eds, eds_to_rms, out_size=64):
         rm_arr[inds] = 1.0
         rms_masks.append(rm_arr)
         
+        # Include all room types in floor plan mask
         if rms_type[k] != 15 and rms_type[k] != 17:
             fp_mk[inds] = k+1
     
-    # trick to remove overlap
+    # trick to remove overlap - apply to all room types
     for k in range(len(nodes)):
         if rms_type[k] != 15 and rms_type[k] != 17:
             rm_arr = np.zeros((out_size, out_size))
@@ -125,158 +128,394 @@ def build_graph_exact(rms_type, fp_eds, eds_to_rms, out_size=64):
     rms_masks = np.array(rms_masks)
     return nodes, triples, rms_masks
 
-def remove_walls_exact(json_file_path, output_size=256):
+def _edges_orientation(p_start, p_end, eps=1e-6):
+    """Return 'h' for horizontal, 'v' for vertical, None otherwise."""
+    dx, dy = p_end - p_start
+    if abs(dy) < eps and abs(dx) > eps:
+        return 'h'
+    if abs(dx) < eps and abs(dy) > eps:
+        return 'v'
+    return None
+
+def _overlap_1d(a_min, a_max, b_min, b_max):
+    return max(a_min, b_min) <= min(a_max, b_max)
+
+def align_adjacent_boundaries(room_polygons, tolerance=0.02):
+    """Snap adjacent horizontal/vertical room edges together to remove gaps.
+
+    A simpler, axis-aligned algorithm that avoids the previous polygon-collapse
+    issue. Two edges are considered adjacent when:
+        • They have the same orientation (horizontal or vertical).
+        • Their perpendicular distance is < tolerance.
+        • Their projections on the orientation axis overlap.
+
+    The shared coordinate (x for vertical edges, y for horizontal) is replaced
+    with the average of the two, ensuring both polygons meet perfectly.
     """
-    Wall removal using exact same preprocessing as rplanhg_datasets.py
+
+    if len(room_polygons) < 2:
+        return room_polygons
+
+    # Work on copies
+    aligned = [poly.copy() for poly in room_polygons]
+
+    num_rooms = len(aligned)
+    for i in range(num_rooms):
+        for j in range(i + 1, num_rooms):
+            poly1, poly2 = aligned[i], aligned[j]
+
+            for idx1 in range(len(poly1)):
+                s1, e1 = poly1[idx1], poly1[(idx1 + 1) % len(poly1)]
+                orient1 = _edges_orientation(s1, e1)
+                if orient1 is None:
+                    continue
+
+                for idx2 in range(len(poly2)):
+                    s2, e2 = poly2[idx2], poly2[(idx2 + 1) % len(poly2)]
+                    orient2 = _edges_orientation(s2, e2)
+                    if orient1 != orient2 or orient2 is None:
+                        continue
+
+                    if orient1 == 'h':  # horizontal -> compare y
+                        if abs(s1[1] - s2[1]) > tolerance:
+                            continue
+                        # Check x-interval overlap
+                        a_min, a_max = sorted([s1[0], e1[0]])
+                        b_min, b_max = sorted([s2[0], e2[0]])
+                        if not _overlap_1d(a_min, a_max, b_min, b_max):
+                            continue
+                        new_y = 0.5 * (s1[1] + s2[1])
+                        poly1[idx1][1] = new_y
+                        poly1[(idx1 + 1) % len(poly1)][1] = new_y
+                        poly2[idx2][1] = new_y
+                        poly2[(idx2 + 1) % len(poly2)][1] = new_y
+
+                    else:  # vertical -> compare x
+                        if abs(s1[0] - s2[0]) > tolerance:
+                            continue
+                        a_min, a_max = sorted([s1[1], e1[1]])
+                        b_min, b_max = sorted([s2[1], e2[1]])
+                        if not _overlap_1d(a_min, a_max, b_min, b_max):
+                            continue
+                        new_x = 0.5 * (s1[0] + s2[0])
+                        poly1[idx1][0] = new_x
+                        poly1[(idx1 + 1) % len(poly1)][0] = new_x
+                        poly2[idx2][0] = new_x
+                        poly2[(idx2 + 1) % len(poly2)][0] = new_x
+
+    # Clean and validate polygons after snapping
+    cleaned = []
+    for poly in aligned:
+        if len(poly) < 3:
+            continue
+        cleaned_poly = _clean_polygon(poly)
+        if cleaned_poly is not None:
+            cleaned.append(cleaned_poly)
+
+    return cleaned
+
+def are_edges_adjacent(p1_start, p1_end, p2_start, p2_end, tolerance):
+    """
+    Check if two edges are adjacent (parallel and close to each other)
+    """
+    # Calculate edge vectors
+    edge1 = p1_end - p1_start
+    edge2 = p2_end - p2_start
+    
+    # Check if edges are roughly parallel
+    edge1_len = np.linalg.norm(edge1)
+    edge2_len = np.linalg.norm(edge2)
+    
+    if edge1_len < 1e-6 or edge2_len < 1e-6:
+        return False, 0
+    
+    edge1_norm = edge1 / edge1_len
+    edge2_norm = edge2 / edge2_len
+    
+    # Check parallelism (dot product should be close to ±1)
+    dot_product = np.dot(edge1_norm, edge2_norm)
+    if np.abs(dot_product) < 0.9:  # Not parallel enough
+        return False, 0
+    
+    # Check if edges are close to each other
+    # Distance from p2_start to line p1_start->p1_end
+    dist1 = point_to_line_distance(p2_start, p1_start, p1_end)
+    dist2 = point_to_line_distance(p2_end, p1_start, p1_end)
+    
+    return (dist1 < tolerance) and (dist2 < tolerance), dot_product
+
+def point_to_line_distance(point, line_start, line_end):
+    """
+    Calculate distance from a point to a line segment
+    """
+    line_vec = line_end - line_start
+    point_vec = point - line_start
+    
+    line_len_sq = np.dot(line_vec, line_vec)
+    if line_len_sq < 1e-6:
+        return np.linalg.norm(point_vec)
+    
+    t = max(0, min(1, np.dot(point_vec, line_vec) / line_len_sq))
+    projection = line_start + t * line_vec
+    
+    return np.linalg.norm(point - projection)
+
+def remove_walls(json_file_path, output_size=256):
+    """
+    Wall removal that excludes interior doors (type 10) and entrances/front doors (type 9) from the output
     """
     # Load JSON data
     with open(json_file_path) as f:
         info = json.load(f)
-    
     rms_type = info['room_type']
     rms_bbs = np.array(info['boxes'])
     fp_eds = np.array(info['edges'])
     eds_to_rms = info['ed_rm']
-    
-    # Exact preprocessing from rplanhg_datasets.py
-    rms_bbs = np.array(rms_bbs)/256.0
-    fp_eds = np.array(fp_eds)/256.0 
-    fp_eds = fp_eds[:, :4]
-    tl = np.min(rms_bbs[:, :2], 0)
-    br = np.max(rms_bbs[:, 2:], 0)
+
+    # Filter out doors/entrances (room_type == 9 or 10)
+    main_room_indices = [i for i, t in enumerate(rms_type) if t not in [9, 10]]
+    filtered_rms_type = [rms_type[i] for i in main_room_indices]
+    filtered_rms_bbs = rms_bbs[main_room_indices]
+
+    # Update eds_to_rms to only include main rooms
+    filtered_eds_to_rms = []
+    edge_keep_indices = []
+    for idx, e_map in enumerate(eds_to_rms):
+        # Only keep if all referenced rooms are main rooms
+        if all(r in main_room_indices for r in e_map):
+            # Remap room indices to new filtered indices
+            new_map = [main_room_indices.index(r) for r in e_map]
+            filtered_eds_to_rms.append(new_map)
+            edge_keep_indices.append(idx)
+
+    # Filter fp_eds to only those edges associated with main rooms
+    filtered_fp_eds = fp_eds[edge_keep_indices]
+
+    # Normalize and centralize as before
+    filtered_rms_bbs = np.array(filtered_rms_bbs)/256.0
+    filtered_fp_eds = np.array(filtered_fp_eds)/256.0 
+    filtered_fp_eds = filtered_fp_eds[:, :4]
+    tl = np.min(filtered_rms_bbs[:, :2], 0)
+    br = np.max(filtered_rms_bbs[:, 2:], 0)
     shift = (tl+br)/2.0 - 0.5
-    rms_bbs[:, :2] -= shift 
-    rms_bbs[:, 2:] -= shift
-    fp_eds[:, :2] -= shift
-    fp_eds[:, 2:] -= shift 
-    
+    filtered_rms_bbs[:, :2] -= shift 
+    filtered_rms_bbs[:, 2:] -= shift
+    filtered_fp_eds[:, :2] -= shift
+    filtered_fp_eds[:, 2:] -= shift 
+
     # Use exact build_graph
-    nodes, triples, rms_masks = build_graph_exact(rms_type, fp_eds, eds_to_rms, out_size=64)
-    
-    print(f"Generated {len(rms_masks)} room masks")
-    for i, mask in enumerate(rms_masks):
-        print(f"Room {i} (type {rms_type[i]}): mask sum = {np.sum(mask)}")
-    
-    # Extract polygons from masks exactly like in rplanhg_datasets.py
+    nodes, triples, rms_masks = build_graph_exact(filtered_rms_type, filtered_fp_eds, filtered_eds_to_rms, out_size=64)
+    # Extract polygons from masks - treat all room types uniformly
     room_polygons = []
     room_types = []
-    
-    for i, (room_mask, room_type) in enumerate(zip(rms_masks, rms_type)):
-        # Skip doors and windows
-        if room_type == 15 or room_type == 17:
-            continue
-            
+    for i, (room_mask, room_type) in enumerate(zip(rms_masks, filtered_rms_type)):
         # Check if mask has any content
         if np.sum(room_mask) == 0:
-            print(f"Skipping empty mask for room {i}")
             continue
-            
         room_mask = room_mask.astype(np.uint8)
-        
         # Resize to 256x256 exactly like reference
         room_mask = cv.resize(room_mask, (256, 256), interpolation=cv.INTER_AREA)
-        
         # Find contours exactly like reference
         contours, _ = cv.findContours(room_mask, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
-        
         if len(contours) > 0:
             contour = contours[0]
             polygon = contour[:, 0, :]
-            
-            # Apply exact same transformation as reference:
-            # reshape, normalize, center, scale
+            # Apply exact same transformation as reference
             polygon = np.reshape(polygon, [len(polygon), 2])/256. - 0.5
             polygon = polygon * 2
-            
             room_polygons.append(polygon)
             room_types.append(room_type)
-            print(f"Added room {i} with {len(polygon)} points")
-    
     return room_polygons, room_types, rms_masks
 
-def visualize_exact(json_file_path):
-    """Visualize the exact reference implementation results"""
-    # Load original data
-    with open(json_file_path) as f:
-        info = json.load(f)
+def convert_polygons_to_edges_and_boxes(room_polygons, room_types, door_polygons=None, door_types=None):
+    if door_polygons is None:
+        door_polygons = []
+    if door_types is None:
+        door_types = []
+        
+    all_polygons = room_polygons + door_polygons
+    all_types = room_types + door_types
     
-    room_polygons, room_types, room_masks = remove_walls_exact(json_file_path)
+    edges = []
+    boxes = []
+    eds_to_rms = []
+    edge_counter = 0
     
-    # Room type names
-    room_names = {
-        1: 'Living Room', 2: 'Bedroom', 3: 'Bathroom', 4: 'Kitchen', 
-        5: 'Balcony', 15: 'Window', 17: 'Door'
-    }
-    
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Original with walls
-    ax = axes[0]
-    ax.set_title('Original Floor Plan (with walls)')
-    
-    all_boxes = np.array(info['boxes'])
-    min_coord = np.min(all_boxes)
-    max_coord = np.max(all_boxes)
-    
-    # Draw rooms as bounding boxes
-    for i, (box, room_type) in enumerate(zip(info['boxes'], info['room_type'])):
-        if room_type not in [15, 17]:
-            x1, y1, x2, y2 = box
-            width = x2 - x1
-            height = y2 - y1
-            rect = plt.Rectangle((x1, y1), width, height, 
-                               fill=False, edgecolor='blue', linewidth=2)
-            ax.add_patch(rect)
+    for room_idx, (polygon, room_type) in enumerate(zip(all_polygons, all_types)):
+        polygon_coords = (polygon / 2 + 0.5) * 256
+        
+        min_x = np.min(polygon_coords[:, 0])
+        min_y = np.min(polygon_coords[:, 1])
+        max_x = np.max(polygon_coords[:, 0])
+        max_y = np.max(polygon_coords[:, 1])
+        
+        boxes.append([float(min_x), float(min_y), float(max_x), float(max_y)])
+        
+        for i in range(len(polygon_coords)):
+            start_point = polygon_coords[i]
+            end_point = polygon_coords[(i + 1) % len(polygon_coords)]
             
-            room_name = room_names.get(room_type, f'Type {room_type}')
-            ax.text(x1 + width/2, y1 + height/2, room_name, 
-                   ha='center', va='center', fontsize=8)
+            edge = [float(start_point[0]), float(start_point[1]), 
+                   float(end_point[0]), float(end_point[1]), room_type, 0]
+            edges.append(edge)
+            
+            eds_to_rms.append([room_idx])
+            edge_counter += 1
     
-    # Draw edges
-    for edge in info['edges']:
-        x1, y1, x2, y2 = edge[:4]
-        ax.plot([x1, x2], [y1, y2], 'r-', linewidth=1, alpha=0.7)
-    
-    ax.set_xlim(min_coord, max_coord)
-    ax.set_ylim(min_coord, max_coord)
-    ax.set_aspect('equal')
-    ax.invert_yaxis()
-    
-    # Processed without walls
-    ax = axes[1]
-    ax.set_title('Processed Floor Plan (walls removed)')
-    
-    colors = plt.cm.Set3(np.linspace(0, 1, len(room_polygons)))
-    
-    for i, (polygon, room_type) in enumerate(zip(room_polygons, room_types)):
-        # Convert from [-1,1] back to original coordinates for plotting
-        # Reverse the transformation: polygon * 2 -> polygon / 2
-        # polygon - 0.5 -> polygon + 0.5  
-        # polygon / 256 -> polygon * 256
-        plot_polygon = (polygon / 2 + 0.5) * 256
-        
-        ax.fill(plot_polygon[:, 0], plot_polygon[:, 1], 
-               color=colors[i], alpha=0.7, edgecolor='black', linewidth=1)
-        
-        centroid = np.mean(plot_polygon, axis=0)
-        room_name = room_names.get(room_type, f'Type {room_type}')
-        ax.text(centroid[0], centroid[1], room_name, 
-               ha='center', va='center', fontsize=8, 
-               bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-    
-    ax.set_xlim(min_coord, max_coord)
-    ax.set_ylim(min_coord, max_coord)
-    ax.set_aspect('equal')
-    ax.invert_yaxis()
-    
-    plt.tight_layout()
-    plt.savefig('wall_removal_exact.png', dpi=150, bbox_inches='tight')
-    print("Exact visualization saved as 'wall_removal_exact.png'")
-    
-    return room_polygons, room_types
+    return edges, boxes, eds_to_rms
 
-if __name__ == "__main__":
-    json_file = "dataset/0.json"
-    print("Testing exact reference implementation...")
-    room_polygons, room_types = visualize_exact(json_file)
-    print(f"Found {len(room_polygons)} rooms with types: {room_types}")
+def process_json_file_to_json(input_json_path, output_json_path, boundary_offset=0.05):
+    try:
+        room_polygons_list, room_types_list, _ = remove_walls(input_json_path)
+        
+        # Align polygons to close gaps between adjacent rooms.
+        aligned_polygons = align_adjacent_boundaries(room_polygons_list)
+        
+        # Create boundary polygons using pyclipper offset
+        boundary_polygons = _create_boundary(aligned_polygons, room_types_list, offset=boundary_offset)
+        
+        # Add boundary polygons to the output with room class 9
+        all_output_polygons = aligned_polygons.copy()
+        all_output_types = room_types_list.copy()
+        
+        # Add boundary polygons with room type 9
+        boundary_room_type = 9  # Boundary room class
+        for boundary_poly in boundary_polygons:
+            all_output_polygons.append(boundary_poly)
+            all_output_types.append(boundary_room_type)
+        
+        new_edges, new_boxes, new_ed_rm_mapping = convert_polygons_to_edges_and_boxes(
+            all_output_polygons, 
+            all_output_types, 
+            [],
+            []
+        )
+        
+        output_polygons_original_scale = []
+        for poly in all_output_polygons:
+            output_polygons_original_scale.append((poly / 2 + 0.5) * 256)
+
+        output_data = {
+            "room_polygons": [p.tolist() for p in output_polygons_original_scale],
+            "rms_type": all_output_types,
+            "edgs_to_rms": new_ed_rm_mapping
+        }
+        
+        with open(output_json_path, 'w') as f:
+            json.dump(output_data, f, indent=2)
+        
+        print(f"Processed {input_json_path} -> {output_json_path} (added {len(boundary_polygons)} boundary polygons)")
+        return True
+        
+    except Exception as e:
+        print(f"Error processing {input_json_path}: {str(e)}")
+        return False
+
+def process_folder_json_files(input_folder, output_folder, boundary_offset=0.05):
+    os.makedirs(output_folder, exist_ok=True)
+    
+    json_files = glob.glob(os.path.join(input_folder, "*.json"))
+    
+    if not json_files:
+        print(f"No JSON files found in {input_folder}")
+        return
+    
+    print(f"Found {len(json_files)} JSON files to process")
+    
+    success_count = 0
+    for json_file in json_files:
+        filename = os.path.basename(json_file)
+        
+        output_path = os.path.join(output_folder, f"{filename}")
+        
+        if process_json_file_to_json(json_file, output_path, boundary_offset):
+            success_count += 1
+    
+    print(f"Successfully processed {success_count}/{len(json_files)} files")
+    
+    return success_count
+
+# -----------------------------------------------------------------------------
+# Helper to clean polygons and prevent collapsing/self-intersections
+# -----------------------------------------------------------------------------
+
+def _clean_polygon(polygon_coords, min_area=1e-4):
+    """Return a cleaned numpy array of polygon coords or None if invalid/too small."""
+    try:
+        poly = _ShapelyPolygon(polygon_coords)
+        # Fix self-intersections
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_empty or poly.area < min_area:
+            return None
+        cleaned = np.asarray(poly.exterior.coords[:-1])  # drop duplicate last point
+        if cleaned.shape[0] < 3:
+            return None
+        return cleaned
+    except (TopologicalError, ValueError):
+        return None
+
+def _create_boundary(room_polygons, room_types, offset=0.05):
+    """
+    Create boundary polygons around all rooms using pyclipper offset.
+    
+    Args:
+        room_polygons: List of room polygons
+        room_types: List of room types corresponding to polygons
+        offset: Offset distance for boundary creation (default 0.05)
+    
+    Returns:
+        List of boundary polygons
+    """
+    # Use polygons directly without additional scaling
+    polygons_for_union = []
+    # Define ONLY the door types to exclude from union
+    door_types = {9, 10}  # Interior Door (10) and Main Door/Entrance (9)
+    
+    # Iterate through all polygons and their types
+    for poly, poly_type in zip(room_polygons, room_types):
+        if len(poly) < 3:  # Need at least 3 points for a valid polygon
+            continue
+        # *** This is the crucial check ***
+        # If the polygon type is NOT one of the specified doors, include it
+        if poly_type not in door_types:  # Exclude Interior Door and Main Door
+            polygons_for_union.append([(float(x), float(y)) for x, y in poly])
+    
+    # If no valid polygons remain for union (unlikely unless only doors exist)
+    if not polygons_for_union:
+        return []
+    
+    # --- The rest of the function uses 'polygons_for_union' ---
+    # Use a scale factor for pyclipper to work reliably.
+    scale_factor = 10000.0  # Higher scale factor for better precision
+    scaled_polys = []
+    # Use the filtered list for the union operation
+    for p in polygons_for_union:
+        scaled_polys.append([(int(x * scale_factor), int(y * scale_factor)) for (x, y) in p])
+    
+    try:
+        pc = pyclipper.Pyclipper()
+        pc.AddPaths(scaled_polys, pyclipper.PT_SUBJECT, closed=True)
+        # The union is calculated ONLY from non-door polygons
+        union_result = pc.Execute(pyclipper.CT_UNION, pyclipper.PFT_EVENODD, pyclipper.PFT_EVENODD)
+        
+        if not union_result:
+            return []
+        
+        # Create offset boundary
+        offsetter = pyclipper.PyclipperOffset()
+        offsetter.AddPaths(union_result, pyclipper.JT_MITER, pyclipper.ET_CLOSEDPOLYGON)
+        offset_result = offsetter.Execute(offset * scale_factor)
+        
+        boundary_polygons = []
+        for out_poly in offset_result:
+            coords = [(x / scale_factor, y / scale_factor) for (x, y) in out_poly]
+            if len(coords) >= 3:  # Ensure valid polygon
+                boundary_polygons.append(np.array(coords))
+        
+        return boundary_polygons
+        
+    except Exception as e:
+        print(f"Error creating boundary: {str(e)}")
+        return []
+
