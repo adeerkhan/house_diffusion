@@ -5,6 +5,7 @@ import cv2 as cv
 from PIL import Image, ImageDraw
 import os
 import glob
+import pyclipper
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.errors import TopologicalError
 from shapely.ops import unary_union
@@ -327,6 +328,24 @@ def remove_walls(json_file_path, output_size=256):
             room_types.append(room_type)
     return room_polygons, room_types, rms_masks
 
+def _snap_coordinates(polygon, snap_to_pixels=True, decimal_places=3):
+    """
+    Snap polygon coordinates to clean values to avoid floating point precision artifacts.
+    
+    Args:
+        polygon: numpy array of polygon coordinates
+        snap_to_pixels: if True, snap to nearest 0.5 pixel (allows half-pixel precision)
+        decimal_places: number of decimal places to round to if not snapping to pixels
+    """
+    if snap_to_pixels:
+        # Snap to nearest 0.5 pixel (allows for half-pixel precision)
+        snapped = np.round(polygon * 2) / 2
+    else:
+        # Round to specified decimal places
+        snapped = np.round(polygon, decimal_places)
+    
+    return snapped
+
 def convert_polygons_to_edges_and_boxes(room_polygons, room_types, door_polygons=None, door_types=None):
     if door_polygons is None:
         door_polygons = []
@@ -343,6 +362,9 @@ def convert_polygons_to_edges_and_boxes(room_polygons, room_types, door_polygons
     
     for room_idx, (polygon, room_type) in enumerate(zip(all_polygons, all_types)):
         polygon_coords = (polygon / 2 + 0.5) * 256
+        
+        # Snap coordinates to clean pixel values
+        polygon_coords = _snap_coordinates(polygon_coords, snap_to_pixels=True)
         
         min_x = np.min(polygon_coords[:, 0])
         min_y = np.min(polygon_coords[:, 1])
@@ -364,15 +386,15 @@ def convert_polygons_to_edges_and_boxes(room_polygons, room_types, door_polygons
     
     return edges, boxes, eds_to_rms
 
-def process_json_file_to_json(input_json_path, output_json_path):
+def process_json_file_to_json(input_json_path, output_json_path, boundary_offset=0.0, snap_to_pixels=True):
     try:
         room_polygons_list, room_types_list, _ = remove_walls(input_json_path)
         
         # Align polygons to close gaps between adjacent rooms.
         aligned_polygons = align_adjacent_boundaries(room_polygons_list)
         
-        # Create boundary polygons using Shapely
-        boundary_polygons = _create_boundary(aligned_polygons, room_types_list)
+        # Create boundary polygons using pyclipper with offset
+        boundary_polygons = _create_boundary(aligned_polygons, room_types_list, boundary_offset=boundary_offset)
         
         # Add boundary polygons to the output with room class 18
         all_output_polygons = aligned_polygons.copy()
@@ -393,7 +415,10 @@ def process_json_file_to_json(input_json_path, output_json_path):
         
         output_polygons_original_scale = []
         for poly in all_output_polygons:
-            output_polygons_original_scale.append((poly / 2 + 0.5) * 256)
+            scaled_poly = (poly / 2 + 0.5) * 256
+            # Snap coordinates to clean pixel values
+            snapped_poly = _snap_coordinates(scaled_poly, snap_to_pixels=snap_to_pixels)
+            output_polygons_original_scale.append(snapped_poly)
 
         output_data = {
             "room_polygons": [p.tolist() for p in output_polygons_original_scale],
@@ -411,7 +436,7 @@ def process_json_file_to_json(input_json_path, output_json_path):
         print(f"Error processing {input_json_path}: {str(e)}")
         return False
 
-def process_folder_json_files(input_folder, output_folder):
+def process_folder_json_files(input_folder, output_folder, boundary_offset=0.0, snap_to_pixels=True):
     os.makedirs(output_folder, exist_ok=True)
     
     json_files = glob.glob(os.path.join(input_folder, "*.json"))
@@ -421,6 +446,8 @@ def process_folder_json_files(input_folder, output_folder):
         return
     
     print(f"Found {len(json_files)} JSON files to process")
+    print(f"Using boundary offset: {boundary_offset}")
+    print(f"Coordinate snapping: {'Half-pixel precision' if snap_to_pixels else 'Float precision'}")
     
     success_count = 0
     for json_file in json_files:
@@ -428,7 +455,7 @@ def process_folder_json_files(input_folder, output_folder):
         
         output_path = os.path.join(output_folder, f"{filename}")
         
-        if process_json_file_to_json(json_file, output_path):
+        if process_json_file_to_json(json_file, output_path, boundary_offset=boundary_offset, snap_to_pixels=snap_to_pixels):
             success_count += 1
     
     print(f"Successfully processed {success_count}/{len(json_files)} files")
@@ -457,37 +484,85 @@ def _clean_polygon(polygon_coords, min_area=1e-4):
 
 def _create_boundary(room_polygons,
                      room_types,
+                     boundary_offset=0.0,
                      door_types={9, 10},     # 9 = entrance, 10 = interior door
                      min_area=1e-4):
     """
-    Build an exterior boundary that traces the exact exterior walls of all rooms (excluding doors).
+    Build an exterior boundary using pyclipper with offset functionality.
 
     Returns
     -------
     List[np.ndarray]  # one or more boundary polygons, each as float (N,2)
     """
-    # 1. Collect only the real rooms
-    polys = [Polygon(p) for p, t in zip(room_polygons, room_types)
-             if t not in door_types and len(p) >= 3]
+    # 1. Collect only the real rooms (exclude doors)
+    cleaned_room_polygons = [Polygon(p) for p, t in zip(room_polygons, room_types)
+                           if t not in door_types and len(p) >= 3]
 
-    if not polys:
+    if not cleaned_room_polygons:
         return []
 
-    # 2. Union everything into a single footprint
-    footprint = unary_union(polys)
+    try:
+        # Use a power-of-2 scale factor for cleaner division
+        scale_factor = 2048.0  # 2^11, provides good precision while dividing cleanly
+        
+        # Convert to scaled integer coordinates for pyclipper
+        scaled_room_polys = [[(int(round(p[0] * scale_factor)), int(round(p[1] * scale_factor))) 
+                             for p in poly.exterior.coords[:-1]] for poly in cleaned_room_polygons]
 
-    # 3. If the result is a MultiPolygon, find the single largest component.
-    # This ensures we only get the main building outline, not detached parts.
-    if isinstance(footprint, MultiPolygon):
-        main_component = max(footprint.geoms, key=lambda p: p.area)
-    else:
-        main_component = footprint
+        # Union all room polygons
+        pc = pyclipper.Pyclipper()
+        pc.AddPaths(scaled_room_polys, pyclipper.PT_SUBJECT, True)
+        union_poly_paths = pc.Execute(pyclipper.CT_UNION, pyclipper.PFT_EVENODD, pyclipper.PFT_EVENODD)
 
-    # 4. Ensure the resulting polygon is valid and extract its exterior coordinates.
-    # This inherently ignores any interior holes.
-    if main_component.is_empty or main_component.area < min_area:
-        return []
+        if not union_poly_paths:
+            return []
 
-    boundary = np.asarray(main_component.exterior.coords[:-1])
-    return [boundary]
+        # Create offset boundary if boundary_offset > 0
+        if boundary_offset > 0:
+            offsetter = pyclipper.PyclipperOffset()
+            offsetter.AddPaths(union_poly_paths, pyclipper.JT_MITER, pyclipper.ET_CLOSEDPOLYGON)
+            
+            # Use rounded offset for cleaner results
+            offset_scaled = round(boundary_offset * scale_factor)
+            exterior_boundary_paths = offsetter.Execute(offset_scaled)
+            
+            if exterior_boundary_paths:
+                boundary_polygons = []
+                for path in exterior_boundary_paths:
+                    outer_boundary = [(p[0] / scale_factor, p[1] / scale_factor) for p in path]
+                    # Ensure the polygon is closed
+                    if not np.array_equal(outer_boundary[0], outer_boundary[-1]):
+                        outer_boundary.append(outer_boundary[0])
+                    boundary_polygons.append(np.array(outer_boundary[:-1]))  # Remove the duplicate last point
+                return boundary_polygons
+        
+        # If no offset, return the union boundary
+        boundary_polygons = []
+        for path in union_poly_paths:
+            boundary = [(p[0] / scale_factor, p[1] / scale_factor) for p in path]
+            boundary_polygons.append(np.array(boundary))
+        return boundary_polygons
+        
+    except Exception as e:
+        print(f"Error in boundary creation with pyclipper: {e}")
+        # Fallback to original shapely method
+        polys = [Polygon(p) for p, t in zip(room_polygons, room_types)
+                 if t not in door_types and len(p) >= 3]
+
+        if not polys:
+            return []
+
+        footprint = unary_union(polys)
+
+        if isinstance(footprint, MultiPolygon):
+            main_component = max(footprint.geoms, key=lambda p: p.area)
+        else:
+            main_component = footprint
+
+        if main_component.is_empty or main_component.area < min_area:
+            return []
+
+        boundary = np.asarray(main_component.exterior.coords[:-1])
+        return [boundary]
+
 
